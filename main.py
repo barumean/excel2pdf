@@ -14,26 +14,15 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
-
-def _check_excel() -> bool:
-    """Excel COM 서버 가용 여부 확인."""
-    try:
-        import win32com.client  # noqa: F401
-        excel = win32com.client.DispatchEx("Excel.Application")
-        excel.Quit()
-        del excel
-        return True
-    except ImportError:
-        return False
-    except Exception:
-        return False
+from app.converter import is_excel_installed
 
 
 def main():
-    # 먼저 최소한의 루트 윈도우를 생성해 messagebox 를 표시할 수 있도록 한다.
     root = _build_root()
+    # Excel 확인이 완료되기 전까지 빈 창이 보이지 않도록 숨김
+    root.withdraw()
 
-    if not _check_excel():
+    if not is_excel_installed():
         messagebox.showerror(
             "Microsoft Excel 없음",
             "이 프로그램은 Microsoft Excel 이 설치된 Windows 환경에서만 실행됩니다.\n\n"
@@ -42,8 +31,9 @@ def main():
         root.destroy()
         sys.exit(1)
 
-    from app.gui import App  # Excel 확인 후 임포트
-    app = App(root)
+    from app.gui import App
+    App(root)
+    root.deiconify()  # 준비 완료 후 창 표시
     root.mainloop()
 
 
@@ -51,10 +41,9 @@ def _build_root() -> tk.Tk:
     """tkinterdnd2 가 있으면 DnD 지원 루트, 없으면 일반 루트를 반환."""
     try:
         from tkinterdnd2 import TkinterDnD
-        root = TkinterDnD.Tk()
+        return TkinterDnD.Tk()
     except ImportError:
-        root = tk.Tk()
-    return root
+        return tk.Tk()
 
 
 if __name__ == "__main__":

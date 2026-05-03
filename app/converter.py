@@ -4,6 +4,7 @@ win32com.client 을 통해 Excel COM 객체를 제어한다.
 UI 스레드와 분리되어 별도 스레드에서 실행된다.
 """
 
+import copy
 import os
 import threading
 import time
@@ -17,15 +18,16 @@ EXCEL_EXTENSIONS = {".xls", ".xlsx", ".xlsm", ".xlsb"}
 # ExportAsFixedFormat 에 전달할 PDF 포맷 상수
 XL_TYPE_PDF = 0
 
-# PrintArea 없이 전체 시트 인쇄 시 xlWorksheet
-XL_PAPER_A4 = 9
-XL_PORTRAIT = 1
-XL_LANDSCAPE = 2
-
 
 class SheetScope(Enum):
     ALL = "all"        # 모든 시트
     ACTIVE = "active"  # 활성(첫번째) 시트만
+
+
+class OverwritePolicy(Enum):
+    OVERWRITE = "overwrite"   # 기존 PDF 덮어쓰기
+    SKIP = "skip"             # 기존 PDF 건너뛰기
+    RENAME = "rename"         # 이름 뒤에 _1, _2 ... 붙이기
 
 
 @dataclass
@@ -36,6 +38,7 @@ class ConversionOptions:
     output_same_folder: bool = True    # 원본 파일과 같은 폴더에 저장
     output_folder: str = ""            # output_same_folder=False 일 때 사용
     skip_hidden_sheets: bool = True
+    overwrite_policy: OverwritePolicy = OverwritePolicy.OVERWRITE
 
 
 @dataclass
@@ -44,6 +47,7 @@ class ConversionResult:
     success: bool
     message: str = ""
     duration: float = 0.0
+    skipped: bool = False
 
 
 @dataclass
@@ -64,8 +68,8 @@ class Converter:
     run() 을 별도 스레드에서 호출한다.
 
     콜백:
-        on_progress(progress: ConversionProgress) - 파일 1개 완료 시마다 호출
-        on_finished(progress: ConversionProgress) - 전체 완료 시 호출
+        on_progress(progress: ConversionProgress) - 파일 1개 완료 시마다 호출 (스냅샷 복사본)
+        on_finished(progress: ConversionProgress) - 전체 완료 시 호출 (스냅샷 복사본)
     """
 
     def __init__(
@@ -94,6 +98,12 @@ class Converter:
     # ------------------------------------------------------------------
 
     def run(self):
+        """
+        별도 스레드 진입점.
+        Windows COM은 스레드마다 CoInitialize/CoUninitialize 가 필요하다.
+        """
+        import pythoncom
+        pythoncom.CoInitialize()
         excel = None
         try:
             excel = self._create_excel_app()
@@ -105,11 +115,22 @@ class Converter:
                 self._progress.done += 1
                 self._progress.results.append(result)
                 if self._on_progress:
-                    self._on_progress(self._progress)
+                    # UI 스레드가 처리하기 전에 워커가 객체를 수정하지 않도록
+                    # 얕은 복사본을 전달한다 (results 는 새 리스트 참조 필요)
+                    snapshot = copy.copy(self._progress)
+                    snapshot.results = list(self._progress.results)
+                    self._on_progress(snapshot)
         finally:
+            # 호출자 참조를 먼저 끊어야 gc 가 COM 레퍼런스를 해제한다
             self._quit_excel(excel)
+            excel = None
+            import gc
+            gc.collect()
             if self._on_finished:
-                self._on_finished(self._progress)
+                snapshot = copy.copy(self._progress)
+                snapshot.results = list(self._progress.results)
+                self._on_finished(snapshot)
+            pythoncom.CoUninitialize()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -131,36 +152,40 @@ class Converter:
             excel.Quit()
         except Exception:
             pass
-        # COM 레퍼런스 해제
-        try:
-            import win32com.client
-            del excel
-        except Exception:
-            pass
-        # 혹시 남은 프로세스 정리
-        try:
-            import gc
-            gc.collect()
-        except Exception:
-            pass
+        # 이 함수 안의 del 은 지역 변수만 해제한다.
+        # 호출자에서 excel = None 으로 참조를 끊은 뒤 gc.collect() 를 호출해야
+        # COM 레퍼런스가 실제로 해제된다 (run() 에서 처리).
 
     def _convert_file(self, excel, file_path: str) -> ConversionResult:
         t0 = time.monotonic()
         wb = None
+        # Excel COM 은 반드시 절대 경로를 요구한다
+        abs_path = os.path.abspath(file_path)
         try:
+            pdf_path = self._build_pdf_path(abs_path)
+
+            # 덮어쓰기 정책 확인
+            if os.path.exists(pdf_path):
+                if self._options.overwrite_policy == OverwritePolicy.SKIP:
+                    return ConversionResult(
+                        path=file_path, success=True, skipped=True,
+                        message="기존 PDF 존재 — 건너뜀",
+                        duration=time.monotonic() - t0,
+                    )
+                elif self._options.overwrite_policy == OverwritePolicy.RENAME:
+                    pdf_path = self._unique_pdf_path(pdf_path)
+
             wb = excel.Workbooks.Open(
-                file_path,
+                abs_path,
                 UpdateLinks=False,
                 ReadOnly=True,
                 IgnoreReadOnlyRecommended=True,
             )
 
-            pdf_path = self._build_pdf_path(file_path)
-
             if self._options.sheet_scope == SheetScope.ALL:
-                self._export_all_sheets(excel, wb, pdf_path)
+                self._export_all_sheets(wb, pdf_path)
             else:
-                self._export_active_sheet(excel, wb, pdf_path)
+                self._export_active_sheet(wb, pdf_path)
 
             duration = time.monotonic() - t0
             return ConversionResult(path=file_path, success=True, duration=duration)
@@ -180,8 +205,8 @@ class Converter:
                 except Exception:
                     pass
 
-    def _build_pdf_path(self, excel_path: str) -> str:
-        src = Path(excel_path)
+    def _build_pdf_path(self, abs_excel_path: str) -> str:
+        src = Path(abs_excel_path)
         if self._options.output_same_folder:
             dest_dir = src.parent
         else:
@@ -189,8 +214,16 @@ class Converter:
             dest_dir.mkdir(parents=True, exist_ok=True)
         return str(dest_dir / (src.stem + ".pdf"))
 
+    def _unique_pdf_path(self, pdf_path: str) -> str:
+        """이미 존재하는 경로면 _1, _2 ... 를 붙여 고유한 경로를 반환."""
+        p = Path(pdf_path)
+        counter = 1
+        while p.exists():
+            p = p.parent / f"{p.stem.rstrip(f'_{counter-1}')}_{counter}.pdf"
+            counter += 1
+        return str(p)
+
     def _apply_fit_to_page(self, sheet):
-        """한 페이지에 모든 열이 들어오도록 설정."""
         try:
             ps = sheet.PageSetup
             ps.Zoom = False
@@ -199,16 +232,14 @@ class Converter:
         except Exception:
             pass
 
-    def _export_all_sheets(self, excel, wb, pdf_path: str):
+    def _export_all_sheets(self, wb, pdf_path: str):
         """
         모든 (인쇄 가능한) 시트를 선택한 뒤 하나의 PDF 로 내보낸다.
         빈 시트나 차트 시트는 건너뛴다.
         """
-        import win32com.client
         printable = []
         for sh in wb.Sheets:
-            # xlChart=3, xlWorksheet=1, xlDialogSheet=5 등
-            if sh.Type != 1:  # xlWorksheet 만 처리
+            if sh.Type != 1:  # xlWorksheet=1 만 처리
                 continue
             if self._options.skip_hidden_sheets and sh.Visible != -1:  # xlSheetVisible=-1
                 continue
@@ -219,7 +250,7 @@ class Converter:
         if not printable:
             raise RuntimeError("변환할 수 있는 워크시트가 없습니다.")
 
-        # 여러 시트를 하나의 PDF 로 내보내려면 시트들을 동시에 선택 후 Export
+        # 여러 시트를 선택한 뒤 ExportAsFixedFormat 하면 선택된 전체가 한 PDF 로 출력된다
         wb.Sheets(printable[0]).Select(Replace=True)
         for name in printable[1:]:
             wb.Sheets(name).Select(Replace=False)
@@ -233,8 +264,7 @@ class Converter:
             OpenAfterPublish=False,
         )
 
-    def _export_active_sheet(self, excel, wb, pdf_path: str):
-        """활성(첫 번째 표시) 시트만 PDF 로 내보낸다."""
+    def _export_active_sheet(self, wb, pdf_path: str):
         sh = wb.ActiveSheet
         if self._options.fit_to_page:
             self._apply_fit_to_page(sh)
@@ -256,22 +286,30 @@ def collect_excel_files(folder: str, recursive: bool) -> List[str]:
     """folder 안에서 엑셀 파일 목록을 수집한다."""
     result = []
     folder_path = Path(folder)
-    pattern = "**/*" if recursive else "*"
-    for p in sorted(folder_path.glob(pattern)):
+    files = folder_path.rglob("*") if recursive else folder_path.glob("*")
+    for p in sorted(files):
         if p.is_file() and p.suffix.lower() in EXCEL_EXTENSIONS:
-            # 임시 파일(~$ 로 시작)은 제외
-            if not p.name.startswith("~$"):
+            if not p.name.startswith("~$"):  # 열려 있는 임시 파일 제외
                 result.append(str(p))
     return result
 
 
 def is_excel_installed() -> bool:
-    """Microsoft Excel COM 서버가 등록되어 있는지 확인."""
+    """Microsoft Excel COM 서버가 등록되어 있는지 확인한다."""
+    import pythoncom
     try:
+        pythoncom.CoInitialize()
         import win32com.client
         excel = win32com.client.DispatchEx("Excel.Application")
         excel.Quit()
         del excel
+        import gc
+        gc.collect()
         return True
     except Exception:
         return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
